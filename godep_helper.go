@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 type Dep struct {
@@ -46,19 +48,16 @@ func main() {
 }
 
 // update:
-// 1. scan Godeps.json
+// 1. scan Godeps/Godeps.json
 // 2. go get package
-// 3. copy package to Godeps/_workspace/
-// 4. update Godeps.json
-// TODO get rid of the annoying error handlings
+// 3. copy package from GOPATH to Godeps/_workspace/
+// 4. update Godeps/Godeps.json
 func update(pkg string) {
 	var err error
-	pwd, err := os.Getwd()
-	if err != nil {
-		errored(err)
-	}
+	pwd, _ := os.Getwd()
 
-	godepFile, err := os.Open(pwd + "/Godeps/Godeps.json")
+	godepFile := pwd + "/Godeps/Godeps.json"
+	godep, err := parseGodep(godepFile)
 	if err != nil {
 		fmt.Println("No Godeps found in current directory")
 		os.Exit(1)
@@ -69,18 +68,15 @@ func update(pkg string) {
 		errored(err)
 	}
 
-	godep, err := parseGodep(godepFile)
+	// looking for the downloaded package from the first dir in GOPATH
+	pkgPath := strings.Split(os.Getenv("GOPATH"), ":")[0] + "/src/" + pkg
+	rev, err := getPackageRev(pkgPath)
 	if err != nil {
 		errored(err)
 	}
 
-	rev, err := getPackageRev(pkg)
-	if err != nil {
-		errored(err)
-	}
-
+	// verify the target package definition in Godeps.json
 	for idx, dep := range godep.Deps {
-		fmt.Println(dep.ImportPath)
 		if dep.ImportPath == pkg {
 			if dep.Rev == rev {
 				fmt.Println("No need to update Godep package", pkg)
@@ -92,20 +88,28 @@ func update(pkg string) {
 		}
 	}
 
-	err = importPackage(pkg, pwd)
+	// copy the downloaded package to Godeps..
+	err = importPackage(pkg, pkgPath, pwd)
+	// ..and update Godeps.json
+	if err == nil {
+		newPkg := &Dep{
+			ImportPath: pkg,
+			Rev:        rev,
+		}
+
+		godep.Deps = append(godep.Deps, newPkg)
+		updated, _ := json.MarshalIndent(godep, "", "\t")
+		err = ioutil.WriteFile(godepFile, updated, os.ModePerm)
+	}
 	if err != nil {
 		errored(err)
 	}
 
-	err = updateGoDeps(pkg, rev, godepFile)
-	if err != nil {
-		errored(err)
-	}
 	fmt.Println("updated", pkg)
 }
 
-func parseGodep(godepFile *os.File) (godep GoDep, err error) {
-	godepJson, err := ioutil.ReadAll(godepFile)
+func parseGodep(godepFile string) (godep GoDep, err error) {
+	godepJson, err := ioutil.ReadFile(godepFile)
 	if err != nil {
 		return
 	}
@@ -129,17 +133,32 @@ func getPackage(pkg string) (err error) {
 	return
 }
 
-//TODO get the git sha of the package from $GOPATH
-func getPackageRev(pkg string) (rev string, err error) {
+func getPackageRev(pkgPath string) (rev string, err error) {
+	os.Chdir(pkgPath)
+	cmd := exec.Command("git", "show-ref", "--hash", "HEAD")
+	std, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Println(errors.New("cannot get HEAD sha in " + pkgPath))
+	} else {
+		rev = strings.TrimSpace(string(std))
+	}
 	return
 }
 
-//TODO copy package from $GOPATH to Godeps/_workspace
-func importPackage(pkg string, rootPath string) (err error) {
-	return
-}
-
-//TODO update Godeps.json
-func updateGoDeps(pkg string, rev string, godepFile *os.File) (err error) {
+func importPackage(pkg string, pkgPath string, rootPath string) (err error) {
+	godepPkgPath := rootPath + "/Godeps/_workspace/" + "src/" + pkg
+	clean := exec.Command("rm", "-rf", godepPkgPath)
+	err = clean.Run()
+	if err == nil {
+		exec.Command("mkdir", "-p", godepPkgPath).Run()
+		paths := strings.Split(godepPkgPath, "/")
+		targetParentPath := strings.Join(paths[:len(paths)-1], "/")
+		cp := exec.Command("cp", "-rf", pkgPath, targetParentPath)
+		std, err := cp.CombinedOutput()
+		if err != nil {
+			fmt.Println(string(std))
+			errored(err)
+		}
+	}
 	return
 }
